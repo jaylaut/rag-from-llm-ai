@@ -1,0 +1,58 @@
+# ============================================================
+# RAG Platform 依赖清单
+# 原则：不引入 LangChain / LlamaIndex 等高层框架，底层全部手写
+# ============================================================
+
+# ---- 核心科学计算 ----
+numpy>=1.26
+pandas>=2.1
+
+# ---- 文档解析（贴合真实语料：md/html/ipynb/xml/RSS）----
+beautifulsoup4>=4.12       # HTML 正文提取
+lxml>=5.0                  # HTML/XML 高性能解析器
+markdownify>=0.13          # HTML → Markdown 转换
+# 说明：真实语料不含 PDF/Word/Excel，故不引入 pypdf/python-docx/openpyxl
+# ipynb 用标准库 json 解析，xml/RSS 用标准库 ElementTree 解析
+
+# ---- HTTP 与请求 ----
+requests>=2.31             # 调用 QWEN-MAX 远程 API
+
+# ---- 进度显示 ----
+tqdm>=4.66
+
+# ---- 向量检索存储 ----
+# 轻量化首选：numpy + faiss-cpu
+faiss-cpu>=1.8             # Facebook 向量相似度检索（CPU 版）
+
+# ---- 中文分词（混合检索 BM25 需要）----
+jieba>=0.42
+
+# ---- 重排（cross-encoder）----
+# 说明：重排模型 Qwen3-Reranker-0.6B 用 llama.cpp（llama-server）本地部署。
+#       选型过程：Ollama 不支持重排模型（无 /api/rerank 端点）；vLLM 要求 GPU
+#       计算能力 7.0+（Volta 起）且不原生支持 Windows，本机 GTX 1050 Ti
+#       （Pascal 6.1）不可行。llama.cpp 支持 Pascal + Windows 官方 release。
+#       官方 GGUF：ggml-org/Qwen3-reranker-0.6B-Q8_0-GGUF（Q8_0 约 639MB）
+#       启动：llama-server -hf ggml-org/Qwen3-reranker-0.6B-Q8_0-GGUF:Q8_0 \
+#              --embedding --rerank --pooling rank --port 9931
+#       过渡期用 EmbeddingReranker（嵌入近似）占位，接口已隔离，llama.cpp 就绪后切换。
+
+# ---- 配置管理 ----
+pydantic>=2.5
+pydantic-settings>=2.0
+python-dotenv>=1.0
+
+# ---- API 服务（轻量）----
+fastapi>=0.110
+uvicorn[standard]>=0.29
+
+# ---- 测试 ----
+pytest>=8.0
+
+# ---- 评估（可选，默认手写指标，见 docs/项目架构.md §9.1）----
+# 说明：检索质量指标（Recall@K/MRR/Faithfulness/Context Precision）手写实现
+#       以理解原理（符合"学底层"定位）；如需交叉校验，可选择性引入：
+# ragas>=0.1         # RAG 评估框架（LLM-as-Judge，需额外依赖）
+# deepeval>=1.0      # 另一种评估框架
+# 注意：这两个框架会引入较多间接依赖，默认不装，需要时再启用
+
