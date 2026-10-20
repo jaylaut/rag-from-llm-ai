@@ -517,3 +517,80 @@ def test_clean_keeps_markdown_structure():
     assert out is not None
     assert "# 标题" in out
     assert "```python" in out
+
+
+# ============================================================================
+# 十、去噪不能破坏代码块 / 近似去重接入主入口（2026-10-20 补）
+# ============================================================================
+def test_denoise_keeps_copyright_line_inside_code_fence():
+    """代码围栏里的 Copyright 行是代码内容（许可头），不能被当页脚噪音删掉。
+
+    【为什么要有这个用例】
+        NOISE_KEYWORDS 含 "Copyright" 与 "转载"。真实语料里大量代码块开头是
+        Apache/MIT 许可声明，旧实现逐行删除会把作者署名和许可条款从代码块里
+        抹掉——结构没坏，但内容永久丢失，且没有任何日志提示。
+    """
+    text = "\n".join([
+        "正文第一行，说明这段示例的用途，内容足够长以避免被当成短文档。",
+        "```python",
+        "# Copyright (c) 2024 The Authors",
+        "# 版权所有 某某公司",              # 代码块内的中文版权行同样要保留
+        "print('hello')",
+        "```",
+        "版权所有 © 2024 某某公司",        # 代码块外的页脚行，应删除
+        "正文第二行，收尾。",
+    ])
+    out = denoise(text)
+
+    assert "# Copyright (c) 2024 The Authors" in out
+    assert "# 版权所有 某某公司" in out
+    assert "print('hello')" in out
+    assert "版权所有 © 2024 某某公司" not in out
+
+
+def test_denoise_keeps_unclosed_fence_content():
+    """未闭合围栏：其后内容一律按代码处理，不做噪音删除（结构性保守）。"""
+    text = "```python\n# Copyright 2024\nprint(1)"
+    out = denoise(text)
+
+    assert "# Copyright 2024" in out
+
+
+def test_clean_uses_simhash_deduplicator_when_provided():
+    """传入 deduplicator 时，近似重复的文档要在主入口被拦下。
+
+    【为什么要有这个用例】
+        文档 2.1.2 的 ④ 明确要求去重 = 精确 + 近似，但旧版 clean() 只查 SHA1，
+        SimHashDeduplicator 写了却没人调用——"看起来实现了，实际没接上"。
+    """
+    dedup = SimHashDeduplicator(threshold=16)      # 放宽阈值，模拟改写版
+    seen: set[str] = set()
+
+    base = "检索增强生成通过外挂知识库降低大模型幻觉。" * 6
+    variant = "检索增强生成通过外挂知识库减少大模型幻觉。" * 6   # 改了一个词
+
+    assert clean(base, seen, deduplicator=dedup) is not None
+    assert len(dedup) == 1
+    assert clean(variant, seen, deduplicator=dedup) is None        # 近似重复被拦
+    assert len(dedup) == 1
+
+
+def test_clean_without_deduplicator_keeps_old_behavior():
+    """不传 deduplicator 时行为与旧版一致（只按 SHA1 判重），保证向后兼容。"""
+    seen: set[str] = set()
+    base = "检索增强生成通过外挂知识库降低大模型幻觉。" * 6
+    variant = "检索增强生成通过外挂知识库减少大模型幻觉。" * 6
+
+    assert clean(base, seen) is not None
+    assert clean(variant, seen) is not None        # 只有精确去重，不拦近似重复
+
+
+def test_clean_does_not_register_rejected_doc_in_deduplicator():
+    """被筛掉的文档不能登记进 deduplicator，否则同内容的下一篇会被误判成重复。"""
+    dedup = SimHashDeduplicator(threshold=3)
+    seen: set[str] = set()
+    short = "中" * 40 + "a" * 59                   # 长度不足，会被筛掉
+
+    assert clean(short, seen, deduplicator=dedup) is None
+    assert len(dedup) == 0
+    assert seen == set()

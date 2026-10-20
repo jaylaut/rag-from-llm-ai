@@ -11,9 +11,11 @@
 #     ① 提取   ② 转文本   ③ 去噪   ④ 去重   ⑤ 筛选   ⑥ 输出
 #   其中 ①② 由 parse.py 完成，③④⑤ 由本文件完成，⑥ 由 pipeline 完成。
 #
-# 【五个关键设计决策（对应文档 2.1.2 + 真实语料校准）】
+# 【六个关键设计决策（对应文档 2.1.2 + 真实语料校准）】
 #   1. 保留 Markdown 结构，不压纯文本（标题/代码块/表格是结构信息）
 #   2. 去重分两级：精确（SHA1）+ 近似（SimHash）——处理 github 的 fork 重复
+#      近似去重在 clean() 里是**显式开关**（deduplicator 参数），因为它是
+#      O(N²)：批量导 fork 时才值得开，单篇上传开了纯浪费
 #   3. 目录页判定用"链接数 + 剩余正文量"双条件，不再只数链接
 #      实测：技术长文的"参考链接/相关阅读"动辄 20+ 条，只数链接会把整篇长文
 #      误判成目录页丢掉，而日志里只表现为"通过率下降"，极难定位。
@@ -22,6 +24,8 @@
 #   5. SimHash 指纹必须跨进程稳定：用 blake2b，禁用内置 hash()
 #      内置 hash() 对 str 带 PYTHONHASHSEED 随机盐，同进程稳定、换进程就漂移；
 #      指纹一旦落盘，重启后会把已入库文档判成新内容。
+#   6. 去噪不碰代码围栏内部：代码块里的 "Copyright" 是代码内容（许可头），
+#      不是网站页脚噪音。删行前必须先知道哪些行在围栏里。
 #
 # 【算法版本（落盘必读）】
 #   SIMHASH_ALGO_VERSION 是"这批指纹能不能互相比"的唯一依据。切词方式、
@@ -29,6 +33,10 @@
 # ============================================================================
 
 # ---------- 导入区 ----------
+# 让类型注解延迟求值：clean() 的签名里要引用文件后半部分才定义的
+#   SimHashDeduplicator，不延迟求值会在 import 时就抛 NameError。
+from __future__ import annotations
+
 # hashlib  ：标准库，blake2b 摘要算法（确定性哈希，跨进程/跨机器一致）
 # re       ：标准库，正则（找链接、压空行、统计汉字）
 # Counter  ：统计 n-gram 频次（SimHash 的权重来源）
@@ -60,6 +68,12 @@ LINK_RE = re.compile(r"\[[^\]]*\]\([^)]*\)")
 
 # 版权/备案/转载行的关键词（命中即整行删除）
 NOISE_KEYWORDS = ("版权所有", "Copyright", "转载", "京ICP", "备案号")
+
+# 代码围栏行（``` 或 ~~~，行首最多 3 格缩进）。
+#   规则与 splitter._scan_structure 保持一致：同一种字符、长度不短于开启标记、
+#   关闭行后面不能再有内容。两处若需调整必须同步，否则"去噪认定的代码块"和
+#   "分块认定的代码块"会不是同一个范围。
+_FENCE_LINE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 
 
 # ============================================================================
@@ -95,6 +109,55 @@ def _is_directory_page(text: str, min_links: int, max_prose: int) -> bool:
     return len(prose) < max_prose
 
 
+def _strip_noise_lines(text: str) -> str:
+    """逐行剔除版权/备案/转载行，但**跳过代码围栏内部的行**。
+
+        【为什么必须跳过代码块】
+            `NOISE_KEYWORDS` 里有 "Copyright"。真实语料里大量代码块的头部是
+                # Copyright (c) 2024 The Authors
+                # Licensed under the Apache License
+            这属于"代码内容"而不是"网站页脚噪音"。不跳过围栏，会把代码块里的
+            许可声明逐行删掉——代码还在，注释没了，作者署名也被抹掉。
+
+        【为什么围栏要自己扫一遍】
+            不能用"删行后再检查围栏配对"来兜底：删掉的行本来就不会破坏配对，
+            问题在于内容被误删，事后无法恢复。必须在删之前就知道哪些行在围栏内。
+
+        【参数】
+            text : str —— 待处理文本（换行符已无要求，按 \\n 切）
+
+        【返回】
+            str —— 剔除噪音行后的文本（行序、围栏标记均原样保留）
+        """
+    kept: list[str] = []
+    in_fence = False
+    fence_char = ""
+    fence_len = 0
+
+    for line in text.split("\n"):
+        m = _FENCE_LINE_RE.match(line)
+        if m:
+            marker = m.group(1)
+            trailing = line[m.end():]
+            if not in_fence:
+                in_fence, fence_char, fence_len = True, marker[0], len(marker)
+            elif (
+                not trailing.strip()
+                and marker[0] == fence_char
+                and len(marker) >= fence_len
+            ):
+                in_fence = False
+            kept.append(line)          # 围栏行本身永远保留
+            continue
+
+        # 围栏内的行一律不参与噪音判定
+        if not in_fence and any(k in line.strip() for k in NOISE_KEYWORDS):
+            continue
+        kept.append(line)
+
+    return "\n".join(kept)
+
+
 def denoise(
     text: str | None,
     *,
@@ -106,7 +169,7 @@ def denoise(
        【处理顺序（顺序本身是契约，测试与冒烟脚本都依赖它）】
            1. 目录页 → 整篇丢弃（返回空串）
            2. 3 个及以上连续换行 → 压成 2 个换行（保留段落间距）
-           3. 版权/备案/转载行 → 整行删除
+           3. 版权/备案/转载行 → 整行删除（**代码围栏内的行不动**）
 
        【参数】
            text      : str | None —— 待清理文本；None/空串返回空串
@@ -135,13 +198,8 @@ def denoise(
     # \n{3,} 匹配"3 个及以上连续换行"，替换成 2 个换行（保留段落间距）
     text = re.sub(r"\n{3,}", "\n\n", text)
 
-    # ---- 第 3 步：逐行剔除版权/声明行 ----
-    lines = []
-    for line in text.split("\n"):
-        if any(k in line.strip() for k in NOISE_KEYWORDS):
-            continue
-        lines.append(line)
-    return "\n".join(lines)
+    # ---- 第 3 步：逐行剔除版权/声明行（代码块内不动）----
+    return _strip_noise_lines(text)
 
 
 # ============================================================================
@@ -372,19 +430,35 @@ def filter_document(
 # ============================================================================
 # 第五部分：组合入口 clean —— 去噪 → 去重 → 筛选
 # ============================================================================
-def clean(text: str | None, seen_hashes: set[str]) -> str | None:
-    """完整的清洗入口：去噪 → 精确去重（查） → 筛选 → 登记指纹。
+def clean(
+    text: str | None,
+    seen_hashes: set[str],
+    *,
+    deduplicator: SimHashDeduplicator | None = None,
+) -> str | None:
+    """完整的清洗入口：去噪 → 精确去重（查） → 近似去重（查） → 筛选 → 登记指纹。
 
        【处理顺序（顺序本身是契约，测试和冒烟都依赖它）】
            1. 去噪：目录页在这里被整篇丢弃
-           2. 精确去重：哈希命中则跳过
-           3. 筛选：长度 + 中文密度（阈值取自 settings）
-           4. 登记指纹：**只有通过筛选的文档才占位**
-              被淘汰的文档不写 seen_hashes —— 它们没入库，不该算"见过"。
+           2. 精确去重：SHA1 命中则跳过（同一份内容，cost ≈ 0）
+           3. 近似去重：SimHash 距离 <= threshold 则跳过（fork/镜像改写版）
+           4. 筛选：长度 + 中文密度（阈值取自 settings）
+           5. 登记指纹：**只有通过筛选的文档才占位**
+              被淘汰的文档不写 seen_hashes / deduplicator —— 它们没入库，
+              不该算"见过"（否则同内容的下一篇会被误判成重复而漏收）。
+
+       【为什么近似去重是可选参数（deduplicator=None 时不做）】
+           精确去重是 O(1) 查表，几乎免费；近似去重要对全部已入库指纹做
+           汉明距离比对，是 O(N)/篇、全量 O(N²)。它在"批量导入 github
+           镜像/fork"的场景价值最大，但对单篇上传、小批量增量是纯开销。
+           所以做成显式开关：由编排层（pipeline/ingestor）决定这一批要不要开，
+           而不是在 clean 里无条件替所有调用方付这笔钱。
 
        【参数】
-           text        : str | None —— 原始文本；None/空串/非字符串一律跳过
-           seen_hashes : Set[str]   —— 已入库文档的 SHA1 集合（调用方跨文档复用）
+           text         : str | None —— 原始文本；None/空串/非字符串一律跳过
+           seen_hashes  : Set[str]   —— 已入库文档的 SHA1 集合（调用方跨文档复用）
+           deduplicator : SimHashDeduplicator | None
+                                     —— 近似去重器；None 表示本批不做近似去重。
 
        【返回】
            str  ：清洗通过，返回清洗后的文本
@@ -409,13 +483,20 @@ def clean(text: str | None, seen_hashes: set[str]) -> str | None:
         log.debug("去重: 内容重复, 跳过")
         return None
 
-    # ---- 第 3 步：筛选（长度 + 中文密度）----
+    # ---- 第 3 步：近似去重（只查，先不登记）----
+    if deduplicator is not None and deduplicator.is_duplicate(text):
+        log.debug("去重: 近似重复(SimHash), 跳过")
+        return None
+
+    # ---- 第 4 步：筛选（长度 + 中文密度）----
     filtered = filter_document(text)
     if filtered is None:
         return None
 
-    # ---- 第 4 步：登记指纹（只有真正入库的文档才占用去重位）----
+    # ---- 第 5 步：登记指纹（只有真正入库的文档才占用去重位）----
     seen_hashes.add(h)
+    if deduplicator is not None:
+        deduplicator.add(filtered)
     return filtered
 
 
@@ -439,6 +520,18 @@ class SimHashDeduplicator:
         【hash_bits 必须与写入端一致】
             指纹的位宽是"能不能互相比"的前提。本类把 hash_bits 存成实例属性，
             is_duplicate / add 都用它，避免调用方两处传参传岔。
+
+        【复杂度与使用边界（重要，别在 3.5 万文件上无脑开）】
+            is_duplicate 是"和已登记的全部指纹逐个比汉明距离"，单篇 O(N)、
+            全量 O(N²)。3.5 万篇 ≈ 6 亿次比对，纯 Python 要跑几个小时。
+            所以：
+              · 全量首建：**不开**（跨仓库重复靠精确 SHA1 + 后续人工抽查）
+              · github 批量导入：**开**，能挡住 fork/镜像的改写版，收益远大于成本
+              · 单篇上传 / 小批增量：**不开**（几百条的 O(N²) 可以忽略，
+                                       但没必要为它多算一次指纹）
+            规模再上一个量级时，正确解法是分桶（把 64 位切成 4 段 16 位，
+            "汉明距离 <= 3"必然至少有一段完全相同，按段建索引即可把比对
+            降到近似 O(N)），届时再改本类内部，接口不变。
         """
 
     def __init__(self, threshold: int = 3, hash_bits: int = 64) -> None:
